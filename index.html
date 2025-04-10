@@ -45,7 +45,7 @@
     #wins { color: #4caf50; }
     #losses { color: #f44336; }
     #winRate { color: #00bcd4; }
-    #accountBalance { color: #ffc107; }
+    #balance { color: #ffc107; }
     .log {
       background: #333;
       padding: 15px;
@@ -236,9 +236,10 @@
         this.tradeCycleCount = 0;
         this.maxTradesPerSession = 12;
         this.tradesInCurrentCycle = 0;
-        this.maxTradesPerCycle = 3;
         this.cycleInterval = 30000;
         this.tradeSpacing = 1000;
+        this.minStake = 0.35;
+        this.maxStakePercentage = 0.35;
         this.updateStats();
       }
       log(message, type = 'info') {
@@ -272,12 +273,12 @@
           return;
         }
         this.initialBalance = parseFloat(document.getElementById("initialBalance").value) || 1;
-        if (this.initialBalance < 0.35) {
-          this.log(`Initial balance must be at least $0.35`, "loss");
+        if (this.initialBalance < this.minStake) {
+          this.log(`Initial balance must be at least $${this.minStake}`, "loss");
           return;
         }
         this.accountBalance = this.initialBalance;
-        this.currentStake = this.calculateInitialStake();
+        this.currentStake = this.calculateOptimalStake();
         this.isRunning = true;
         try {
           this.ws = new WebSocket("wss://ws.binaryws.com/websockets/v3?app_id=1089");
@@ -344,24 +345,34 @@
             subscribe: 1
           }));
         });
+        // Start trade cycle every 30 seconds
+        this.tradeCycleInterval = setInterval(() => {
+          if (this.isRunning) {
+            this.executeTradeCycle();
+          }
+        }, this.cycleInterval);
       }
       processTick(tick) {
         const market = tick.symbol;
         const price = tick.quote;
         this.analysis[market].updateData(price);
         this.log(`${market} price update: ${price.toFixed(5)}`, 'info');
-        if (this.tradeCycleCount < this.maxTradesPerSession) {
-          this.executeTradeCycle(market);
-        }
       }
-      executeTradeCycle(market) {
-        const signal = this.analysis[market].analyzeMarket();
+      executeTradeCycle() {
+        this.markets.forEach(market => {
+          this.executeHedgedTrade(market);
+        });
+      }
+      executeHedgedTrade(market) {
+        const analysis = this.analysis[market];
+        const signal = analysis.analyzeMarket();
         if (!signal || signal === 'NEUTRAL') {
           this.log(`No clear signal for ${market}. Skipping trade.`);
           return;
         }
+        // Ensure sufficient balance
         this.currentStake = this.calculateOptimalStake();
-        if (this.currentStake < 0.35) {
+        if (this.currentStake < this.minStake) {
           this.log(`Stake $${this.currentStake} below minimum. Skipping trade.`, 'loss');
           return;
         }
@@ -369,24 +380,11 @@
           this.log(`Insufficient balance for stake $${this.currentStake}. Skipping trade.`, 'loss');
           return;
         }
-        this.log(`Executing ${signal} trade on ${market} with stake $${this.currentStake.toFixed(2)}`);
-        this.ws.send(JSON.stringify({
-          buy: 1,
-          subscribe: 1,
-          price: this.currentStake,
-          parameters: {
-            amount: this.currentStake,
-            basis: "stake",
-            contract_type: signal,
-            currency: "USD",
-            duration: 1,
-            duration_unit: "t",
-            symbol: market
-          }
-        }));
-        // Execute Touch/No Touch hedge
-        const touchStake = this.currentStake * 0.5;
-        const noTouchStake = this.currentStake * 0.3;
+        // Execute Touch/No Touch hedged trade
+        const touchStake = this.currentStake * 0.6;
+        const noTouchStake = this.currentStake * 0.4;
+        this.log(`Executing hedged trade on ${market}: Touch ($${touchStake.toFixed(2)}) | No Touch ($${noTouchStake.toFixed(2)})`);
+        // Send Touch trade
         this.ws.send(JSON.stringify({
           buy: 1,
           subscribe: 1,
@@ -402,32 +400,30 @@
             symbol: market
           }
         }));
-        this.ws.send(JSON.stringify({
-          buy: 1,
-          subscribe: 1,
-          price: noTouchStake,
-          parameters: {
-            amount: noTouchStake,
-            basis: "stake",
-            contract_type: "NOTOUCH",
-            currency: "USD",
-            barrier: "-0.0001",
-            duration: 1,
-            duration_unit: "t",
-            symbol: market
-          }
-        }));
-        this.tradesInCurrentCycle++;
+        // Send No Touch trade
+        setTimeout(() => {
+          this.ws.send(JSON.stringify({
+            buy: 1,
+            subscribe: 1,
+            price: noTouchStake,
+            parameters: {
+              amount: noTouchStake,
+              basis: "stake",
+              contract_type: "NOTOUCH",
+              currency: "USD",
+              barrier: "-0.0001",
+              duration: 1,
+              duration_unit: "t",
+              symbol: market
+            }
+          }));
+        }, 500); // Delay to avoid simultaneous execution issues
         this.tradeCycleCount++;
         this.updateStats();
       }
-      calculateInitialStake() {
-        const stake = this.accountBalance * 0.35;
-        return Math.round(Math.max(stake, 0.35) * 100) / 100;
-      }
       calculateOptimalStake() {
-        let stake = this.accountBalance * 0.35;
-        return Math.round(Math.max(stake, 0.35) * 100) / 100;
+        const stake = this.accountBalance * this.maxStakePercentage;
+        return Math.round(Math.max(stake, this.minStake) * 100) / 100;
       }
       handleBuyResponse(buyData) {
         this.log(`Trade executed: ${buyData.longcode}`);
